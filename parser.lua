@@ -1,5 +1,3 @@
-local json = require 'json'
-
 ---@type string, string
 local sourcePath, sourceContent
 ---@type integer?, string?, integer, integer
