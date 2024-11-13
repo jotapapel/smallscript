@@ -1,0 +1,459 @@
+var generate = require('generator');
+
+var sourcePath, sourceContent,
+    lastIndex, lastValue, currentIndex, currentRow,
+    parseExpression, parseStatement;
+
+sub match (a, ...)
+    for b = 1 to select('#', ...) do
+        if a == select(b, ...) then
+            return a;
+        end
+    end
+end
+
+def eof ()
+    return not sourceContent:byte(currentIndex);
+end
+
+def parse (p, ...)
+    var toIndex, firstValue;
+    [ lastIndex, toIndex, firstValue, lastValue ] = sourceContent:find("^(%s*)${p}", currentIndex);
+    if select('#', ...) == 0 and lastValue or match(lastValue, ...) then
+        var [ _, rowCount ] = firstValue:gsub('[\n\r]', '');
+        [ currentIndex, currentRow ] = [ toIndex + 1, currentRow + rowCount ];
+        return lastValue;
+    end
+end
+
+def throw (m, from, pattern)
+    [ pattern, currentIndex ] = [ pattern or '(%S+)', from or lastIndex or currentIndex ];
+    var hint = parse(pattern) and "\"${lastValue}\"" or '<eof>';
+    io.write("[${sourcePath}] smc:${currentRow} ${m} near ${hint}.\n");
+    os.exit();
+end
+
+var reservedKeywords = [
+    'true': true, 'false': true, 'undef': true,
+	'and': true, 'or': true, 'is': true,
+	'not': true, 'sizeof': true, 'typeof': true,
+	'var': true, 'def': true, 'return': true,
+	'if': true, 'then': true, 'else': true,
+	'do': true, 'while': true, 'until': true,
+	'for': true, 'to': true, 'step': true, 'of': true, 'in': true,
+	'break': true, 'end': true
+];
+
+var escapedCharacters = [
+    34: '\"', 36: '$', 39: '\'',
+	92: '\\', 97: 'a', 98: 'b',
+	102: 'f', 110: 'n', 114: 'r',
+	115: 't', 118: 'v'
+];
+
+def parseIdentifier ()
+	if parse('(%p)', '(') then
+		var expression = parseExpression()
+		if not parse('(%p)', ')') then
+			throw("')' expected");
+		end
+		return [ 'kind': 'GroupExpression', 'expression': expression ];
+	else if not parse('([_%a][_%w]*)') or reservedKeywords[lastValue] then
+		throw('unexpected symbol');
+	end
+	return [ 'kind': 'Identifier', 'value': lastValue ];
+end
+
+def parseTemplate (str)
+    var newStr = str:gsub('${(.-)}', def (t)
+        return "\" .. tostring(${t}) .. \"";
+    end)
+    return "\"${newStr}\"";
+end
+
+def parseLiteral ()
+    var value,
+		startIndex = currentIndex;
+	if parse("'([^']*)") then
+		value = string.format("'%s'", lastValue):gsub('\\u(%x+)', def (c)
+			var n = tonumber(c, 16);
+			return "\\${escapedCharacters[n] or string.char(n)}";
+		end);
+		if not parse('(%p)', "'") then
+			throw('malformed string', startIndex, '([^\n\r]*)');
+		end
+	else if parse('"([^"]*)') then
+		value = parseTemplate(lastValue):gsub('\\u(%x+)', def (c)
+			var n = tonumber(c, 16);
+			return "\\${escapedCharacters[n] or string.char(n)}";
+		end);
+		if not parse('(%p)', '"') then
+			throw('malformed string', startIndex, '([^\n\r]*)');
+		end
+	else if parse('(%d[%d_]*)') then
+		var firstValue = lastValue,
+			secondValue = parse('(%.?%d[_%d]*)') or '';
+		if parse('(%p)', '.') then
+			throw('malformed number', startIndex);
+		end
+		value = string.gsub(firstValue .. secondValue, '_', '') + 0;
+	else if parse('(&)%f[%x]') then
+		if not parse('(%x+)') then
+			throw('malformed number', startIndex);
+		end
+		value = tonumber(lastValue, 16);
+	else if parse('(%l+)', 'true', 'false', 'undef') then
+		if lastValue == 'true' then
+			value = true;
+		else if lastValue == 'false' then
+			value = false;
+		end
+	else if parse('(%p+)%f[^.]', '...') then
+		value = lastValue;
+	else
+		return parseIdentifier();
+	end
+	return [ 'kind': 'Literal', 'value': value ];
+end
+
+def parseRecordExpression (dstrc)
+	if parse('(%p)', '[') then
+		var entries = [];
+		if not parse('(%p)', ']') then
+			do
+				var field, property = parseExpression();
+				if parse('(%p)', ':', ',') == ':' then
+					if property.kind <> 'Literal' or not match(typeof property.value, 'string', 'number') then
+						throw('<string> or <number> expected')
+					else if dstrc then
+						throw('unexpected symbol');
+					end
+					[ field, property ] = [ property, parseExpression() ];
+					parse('(%p)', ',');
+				end
+				entries[#entries + 1] = [ 'kind': 'Entry', 'field': field, 'property': property ];
+			until parse('(%p)', ']') or eof()
+			if not lastValue then
+				throw("']' expected");
+			end
+		end
+		return [ 'kind': 'RecordExpression', 'entries': entries, 'destructure': dstrc ];
+	end
+	return parseLiteral();
+end
+
+def parseCallExpression (callee)
+	while parse('(%p)', '(') do
+		var arguments = []
+		if not parse('(%p)', ')') then
+			do
+				arguments[#arguments + 1] = parseExpression();
+			until not parse('(%p)', ',') or eof()
+			if not parse('(%p)', ')') then
+				throw("')' expected");
+			end
+		end
+		callee = [ 'kind': 'CallExpression', 'callee': callee, 'arguments': arguments ];
+	end
+	return callee;
+end
+
+def parseMemberExpression (dstrc)
+	var lastNode = parseRecordExpression(dstrc);
+	if lastNode.kind == 'Identifier' then
+		lastNode = parseCallExpression(lastNode);
+		while parse('(%p)%f[#%P]', '.', ':', '[') do
+			var indexer, id, computed;
+			if lastValue == '[' then
+				[ id, computed ] = [ parseExpression(), true ];
+				if not parse('(%p)', ']') then
+					throw("']' expected");
+				end
+			else
+				[ indexer, id, computed ] = [ lastValue, parseIdentifier(), false ];
+				if id.kind <> 'Identifier' then
+					throw('<identifier> expected');
+				end
+			end
+			lastNode = parseCallExpression([ 'kind': 'MemberExpression', 'record': lastNode, 'id': id, 'computed': computed, 'indexer': indexer ]);
+			if lastNode.kind == 'MemberExpression' and lastNode.indexer == ':' then
+				throw('function arguments expected');
+			end
+		end
+	end
+	return lastNode;
+end
+
+def parseBlockStatement ()
+	var body = [];
+	while not parse('(%l+)', 'end') and not eof() do
+		body[#body + 1] = parseStatement();
+	end
+	if not lastValue then
+		throw("'end' expected");
+	end
+	return [ 'kind': 'BlockStatement', 'body': body ];
+end
+
+def parseFunctionExpression ()
+	if parse('(%l+)', 'def') then
+		var parameters = [];
+		if not parse('(%p)', '(') then
+			throw("'(' expected");
+		else if not parse('(%p)', ')') then
+			do
+				var parameter = parseIdentifier();
+				if parameter.kind <> 'Identifier' then
+					throw('<identifier> expected');
+				end
+				parameters[#parameters + 1] = parameter;
+			until not parse('(%p)', ',') or eof()
+			if not parse('(%p)', ')') then
+				throw("')' expected");
+			end
+		end
+		return [ 'kind': 'FunctionExpression', 'parameters': parameters, 'body': parseBlockStatement() ];
+	end
+	return parseMemberExpression();
+end
+
+def parseUnaryExpression ()
+	while parse('(%l+)', 'not', 'sizeof', 'typeof') or parse('(%p+)', '#', '...', '-') do
+		return [ 'kind': 'UnaryExpression', 'operator': lastValue, 'argument': parseFunctionExpression() ];
+	end
+	return parseFunctionExpression();
+end
+
+def parseMultiplicativeExpression ()
+	var left = parseUnaryExpression();
+	while parse('(%p+)', '*', '/', '^', '%', '..') do
+		left = [ 'kind': 'BinaryExpression', 'left': left, 'operator': lastValue, 'right': parseUnaryExpression() ];
+	end
+	return left;
+end
+
+def parseAdditiveExpression ()
+	var left = parseMultiplicativeExpression();
+	while parse('(%p)', '+', '-') do
+		left = [ 'kind': 'BinaryExpression', 'left': left, 'operator': lastValue, 'right': parseMultiplicativeExpression() ];
+	end
+	return left;
+end
+
+def parseComparisonExpression ()
+	var left = parseAdditiveExpression();
+	while parse('(%p+)', '==', '<>', '<', '<=', '>', '>=') do
+		left = [ 'kind': 'BinaryExpression', 'left': left, 'operator': lastValue, 'right': parseAdditiveExpression() ];
+	end
+	return left;
+end
+
+def parseLogicalExpression ()
+	var left = parseComparisonExpression();
+	while parse('(%l+)', 'and', 'or') do
+		left = [ 'kind': 'BinaryExpression', 'left': left, 'operator': lastValue, 'right': parseComparisonExpression() ];
+	end
+	return left;
+end
+
+def parseExpression ()
+	return parseLogicalExpression();
+end
+
+def parseExpressionStatement ()
+	var expression = parseMemberExpression(true);
+	if not match(expression.kind, 'MemberExpression', 'CallExpression', 'RecordExpression', 'GroupExpression', 'Identifier') then
+		throw('syntax error');
+	else if expression.kind == 'GroupExpression' then
+		expression = parseCallExpression(expression);
+	else if expression.kind <> 'CallExpression' then
+		if parse('(%p+)%f[^+-]', '++', '--') then
+			expression = [ 'kind': 'UpdateExpression', 'argument': expression, 'operator': lastValue ];
+		else
+			var right,
+				operator = parse('(%p+)%f[=]', '+', '-', '*', '/', '//', '^', '%', '..');
+			if (expression.kind == 'RecordExpression' and operator) or not parse('(%p)', '=') then
+				throw("'=' expected");
+			end
+			[ operator, right ] = [ operator or lastValue, parseExpression() ];
+			if expression.kind == right.kind then
+				right.destructure = true;
+			end
+			expression = [ 'kind': 'AssignmentExpression', 'left': expression, 'operator': operator, 'right': right ];
+		end
+	end
+	parse('(%p)', ';');
+	return [ 'kind': 'ExpressionStatement', 'expression': expression ];
+end
+
+def parseStatement ()
+	var lastNode;
+	// Comments
+	if parse('(%p+)', '//') then
+		parse('([^\n\r]*)')
+	// VariableDeclaration
+	else if parse('(%l+)', 'var', 'def', 'return', 'if', 'do', 'while', 'for', 'break') == 'var' then
+		var declarations = [];
+		do
+			var init,
+				id = parseRecordExpression(true);
+			if not match(id.kind, 'RecordExpression', 'Identifier') then
+				throw('<identifier> expected');
+			else if parse('(%p)', '=') then
+				init = parseExpression();
+			end
+			declarations[#declarations + 1] = [ 'kind': 'VariableDeclarator', 'id': id, 'init': init ];
+		until not parse('(%p)', ',') or eof()
+		lastNode = [ 'kind': 'VariableDeclaration', 'declarations': declarations ];
+	// FunctionDeclaration
+	else if lastValue == 'def' then
+		var name = parseIdentifier(),
+			parameters = [];
+		if name.kind <> 'Identifier' then
+			throw('<name> expected');
+		else if not parse('(%p)', '(') then
+			throw("'(' expected");
+		else if not parse('(%p)', ')') then
+			do
+				var parameter = parseLiteral();
+				if parameter.kind == 'GroupExpression' then
+					throw("<identifier> or '...' expected");
+				else if parameters[#parameters] and parameters[#parameters].value == '...' and parameter.value == '...' then
+					throw("')' expected");
+				end
+				parameters[#parameters + 1] = parameter;
+			until not parse('(%p)', ',') or eof()
+			if not parse('(%p)', ')') then
+				throw("')' expected");
+			end
+		end
+		lastNode = [ 'kind': 'FunctionDeclaration', 'name': name, 'parameters': parameters, 'body': parseBlockStatement() ];
+	// ReturnStatement
+	else if lastValue == 'return' then
+		var arguments = [];
+		do
+			arguments[#arguments + 1] = parseExpression();
+		until not parse('(%p)', ',') or eof()
+		lastNode = [ 'kind': 'ReturnStatement', 'arguments': arguments ];
+	// IfStatement
+	else if lastValue == 'if' then
+		var finalNode = [];
+		var currentNode = finalNode;
+		while lastValue == 'if' or lastValue == 'else' do
+			var testExpression,
+				currentValue = lastValue,
+				blockStatement = [ 'kind': 'BlockStatement', 'body': [] ],
+				isNested = false,
+				targetKey = 'consequent';
+			if currentValue == 'else' then
+				[ isNested, targetKey ] = [ parse('(%l+)', 'if'), 'alternate' ];
+			end
+			if lastValue == 'if' then
+				testExpression = parseExpression();
+				if not parse('(%l+)', 'then') then
+					throw("'then' expected")
+				end
+			end
+			while not parse('(%l+)', 'end') and not eof() do
+				blockStatement.body[#blockStatement.body + 1] = parseStatement();
+				if parse('(%l+)', 'else') then
+					if currentValue == lastValue and not isNested then
+						throw("'end' expected");
+					end
+					break;
+				end
+			end
+			if not lastValue then
+				throw("'end' expected");
+			end
+			currentNode[targetKey] = isNested and [ 'kind': 'IfStatement', 'test': testExpression, 'consequent': blockStatement ] or blockStatement
+			currentNode = (targetKey == 'alternate') and currentNode[targetKey] or currentNode;
+			[ currentNode.kind, currentNode.test ] = [ testExpression and 'IfStatement' or 'BlockStatement', testExpression ];
+		end
+		lastNode = finalNode;
+	// DoStatement
+	else if lastValue == 'do' or lastValue == 'while' then
+		var keyword = lastValue,
+			body = [],
+			loop, test;
+		if keyword == 'while' then
+			[ loop, test ] = [ keyword, parseExpression() ];
+			if not parse('(%l+)', 'do') then
+				throw("'do' expected");
+			end
+		end
+		while not parse('(%l+)', 'until', 'end') and not eof() do
+			body[#body + 1] = parseStatement();
+		end
+		if not lastValue or (keyword == 'while' and lastValue == 'until')  then
+			throw("'end' expected");
+		else if lastValue == 'until' then
+			[ loop, test ] = [ lastValue, parseExpression() ];
+		end
+		lastNode = [ 'kind': 'DoStatement', 'test': test, 'loop': loop, 'body': [ 'kind': 'BlockStatement', 'body': body ] ];
+	// ForStatement
+	else if lastValue == 'for' then
+		var firstExpression = parseIdentifier();
+		if firstExpression.kind <> 'Identifier' then
+			throw('<variable> expected');
+		else if parse('(%p)', ',', '=') == '=' then
+			var init = [ 'kind': 'AssignmentExpression', 'left': firstExpression, 'operator': lastValue, 'right': parseExpression() ];
+			if not parse('(%l+)', 'to') then
+				throw("'to' expected")
+			end
+			var goalExpression = parseExpression(),
+				stepExpression = parse('(%l+)', 'step') and parseExpression();
+			lastNode = [ 'kind': 'ForStatement', 'init': init, 'goal': goalExpression, 'step': stepExpression ];
+		else
+			var left = [ firstExpression ];
+			if lastValue == ',' then
+				while lastValue == ',' do
+					var variable = parseIdentifier();
+					if variable.kind <> 'Identifier' then
+						throw('<identifier> expected');
+					end
+					left[#left + 1] = variable;
+					parse('(%p)', ',');
+				end
+			end
+			if not parse('(%l+)', 'in', 'of') then
+				throw("'in', 'of' expected");
+			end
+			var operator = lastValue,
+				right = parseExpression();
+			lastNode = [ 'kind': 'ForEachStatement', 'left': left, 'operator': operator, 'right': right ];
+		end
+		if not parse('(%l+)', 'do') then
+			throw("'do' expected");
+		end
+		lastNode.body = parseBlockStatement();
+	// BreakStatement
+	else if lastValue == 'break' then
+		lastNode = [ 'kind': 'BreakStatement' ];
+	// ExpressionStatement
+	else
+		return parseExpressionStatement();
+	end
+	parse('(%p)', ';');
+	return lastNode;
+end
+
+do
+	sourcePath = ...;
+	sourceContent = io.open(sourcePath, 'r'):read('*a'):match('(.-)%s*$'):gsub('\\([abfnrtv\\\"\'$])', def (c)
+		var byte = string.byte(c);
+		return string.format('\\u%04x', byte);
+	end);
+    [ currentIndex, currentRow ] = [ 1, 1 ];
+
+	var ast = [ 'kind': 'Program', 'body': [] ];
+	while not eof() do
+		var lastNode = parseStatement()
+		ast.body[#ast.body + 1] = lastNode;
+		parse('(%p)', ';')
+	end
+
+	var code = generate(ast);
+	io.write("${code}\n");
+	os.exit();
+end
